@@ -72,7 +72,8 @@ class Project {
 		if (existsFile(selverfile)) {
 			try m_selections = new SelectedVersions(selverfile);
 			catch(Exception e) {
-				logDiagnostic("A " ~ SelectedVersions.defaultFile ~ " file was not found or failed to load:\n%s", e.msg);
+				logWarn("Failed to load %s: %s", SelectedVersions.defaultFile, e.msg);
+				logDiagnostic("Full error: %s", e.toString().sanitize);
 				m_selections = new SelectedVersions;
 			}
 		} else m_selections = new SelectedVersions;
@@ -138,7 +139,9 @@ class Project {
 					auto dv = p.dependencies[dn];
 					// filter out dependencies not in the current configuration set
 					if (!p.hasDependency(dn, cfg)) continue;
-					auto dependency = getDependency(dn, dv.optional);
+					auto dependency = getDependency(dn, true);
+					assert(dependency || dv.optional,
+						format("Non-optional dependency %s of %s not found in dependency tree!?.", dn, p.name));
 					if(dependency) perform_rec(dependency);
 					if( ret ) return;
 				}
@@ -231,19 +234,47 @@ class Project {
 		m_dependencies = null;
 		m_packageManager.refresh(false);
 
-		void collectDependenciesRec(Package pack)
+		void collectDependenciesRec(Package pack, int depth = 0)
 		{
-			logDebug("Collecting dependencies for %s", pack.name);
+			auto indent = replicate("  ", depth);
+			logDebug("%sCollecting dependencies for %s", indent, pack.name);
+			indent ~= "  ";
+
 			foreach (name, vspec_; pack.dependencies) {
 				Dependency vspec = vspec_;
 				Package p;
-				if (!vspec.path.empty) {
+
+				auto basename = getBasePackageName(name);
+				if (name == m_rootPackage.basePackage.name) {
+					vspec = Dependency(m_rootPackage.ver);
+					p = m_rootPackage.basePackage;
+				} else if (basename == m_rootPackage.basePackage.name) {
+					vspec = Dependency(m_rootPackage.ver);
+					try p = m_packageManager.getSubPackage(m_rootPackage.basePackage, getSubPackageName(name), false);
+					catch (Exception e) {
+						logDiagnostic("%sError getting sub package %s: %s", indent, name, e.msg);
+						continue;
+					}
+				} else if (m_selections.hasSelectedVersion(basename)) {
+					vspec = m_selections.getSelectedVersion(basename);
+					p = m_packageManager.getBestPackage(name, vspec);
+				} else if (m_dependencies.canFind!(d => getBasePackageName(d.name) == basename)) {
+					auto idx = m_dependencies.countUntil!(d => getBasePackageName(d.name) == basename);
+					auto bp = m_dependencies[idx].basePackage;
+					vspec = Dependency(bp.path);
+					p = m_packageManager.getSubPackage(bp, getSubPackageName(name), false);
+				} else {
+					logDiagnostic("%sVersion selection for dependency %s (%s) of %s is missing.",
+						indent, basename, name, pack.name);
+				}
+
+				if (!p && !vspec.path.empty) {
 					Path path = vspec.path;
 					if (!path.absolute) path = pack.path ~ path;
-					logDiagnostic("Adding local %s", path);
+					logDiagnostic("%sAdding local %s", indent, path);
 					p = m_packageManager.getOrLoadPackage(path, PathAndFormat.init, true);
 					if (p.parentPackage !is null) {
-						logWarn("Sub package %s must be referenced using the path to it's parent package.", name);
+						logWarn("%sSub package %s must be referenced using the path to it's parent package.", indent, name);
 						p = p.parentPackage;
 					}
 					if (name.canFind(':')) p = m_packageManager.getSubPackage(p, getSubPackageName(name), false);
@@ -253,42 +284,15 @@ class Project {
 				}
 
 				if (!p) {
-					auto basename = getBasePackageName(name);
-					if (name == m_rootPackage.basePackage.name) {
-						vspec = Dependency(m_rootPackage.ver);
-						p = m_rootPackage.basePackage;
-					} else if (basename == m_rootPackage.basePackage.name) {
-						vspec = Dependency(m_rootPackage.ver);
-						try p = m_packageManager.getSubPackage(m_rootPackage.basePackage, getSubPackageName(name), false);
-						catch (Exception e) {
-							logDiagnostic("Error getting sub package %s: %s", name, e.msg);
-							continue;
-						}
-					} else if (m_selections.hasSelectedVersion(basename)) {
-						vspec = m_selections.getSelectedVersion(basename);
-						p = m_packageManager.getBestPackage(name, vspec);
-					} else if (m_dependencies.canFind!(d => getBasePackageName(d.name) == basename)) {
-						auto idx = m_dependencies.countUntil!(d => getBasePackageName(d.name) == basename);
-						auto bp = m_dependencies[idx].basePackage;
-						vspec = Dependency(bp.path);
-						p = m_packageManager.getSubPackage(bp, getSubPackageName(name), false);
-					} else {
-						logDiagnostic("Version selection for dependency %s (%s) of %s is missing.",
-							basename, name, pack.name);
-						continue;
-					}
-				}
-
-				if (!p) {
-					logDiagnostic("Missing dependency %s %s of %s", name, vspec, pack.name);
+					logDiagnostic("%sMissing dependency %s %s of %s", indent, name, vspec, pack.name);
 					continue;
 				}
 
 				if (!m_dependencies.canFind(p)) {
-					logDiagnostic("Found dependency %s %s", name, vspec.toString());
+					logDiagnostic("%sFound dependency %s %s", indent, name, vspec.toString());
 					m_dependencies ~= p;
 					p.warnOnSpecialCompilerFlags();
-					collectDependenciesRec(p);
+					collectDependenciesRec(p, depth+1);
 				}
 
 				m_dependees[p] ~= pack;
@@ -742,6 +746,9 @@ class Project {
 		import std.range : only;
 
 		string[] list;
+
+		enforce(projectDescription.lookupRootPackage().targetType != TargetType.none,
+			"Target type is 'none'. Cannot list build settings.");
 		
 		auto targetDescription = projectDescription.lookupTarget(projectDescription.rootPackage);
 		auto buildSettings = targetDescription.buildSettings;
@@ -1224,6 +1231,7 @@ final class SelectedVersions {
 		enum FileVersion = 1;
 		Selected[string] m_selections;
 		bool m_dirty = false; // has changes since last save
+		bool m_bare = true;
 	}
 
 	enum defaultFile = "dub.selections.json";
@@ -1241,11 +1249,15 @@ final class SelectedVersions {
 		auto json = jsonFromFile(path);
 		deserialize(json);
 		m_dirty = false;
+		m_bare = false;
 	}
 
 	@property string[] selectedPackages() const { return m_selections.keys; }
 
 	@property bool dirty() const { return m_dirty; }
+
+	/// Determine if this set of selections is empty and has not been saved to disk.
+	@property bool bare() const { return m_bare && !m_dirty; }
 
 	void clear()
 	{
@@ -1301,9 +1313,27 @@ final class SelectedVersions {
 		Json json = serialize();
 		auto file = openFile(path, FileMode.createTrunc);
 		scope(exit) file.close();
-		file.writePrettyJsonString(json);
-		file.put('\n');
+
+		assert(json.type == Json.Type.object);
+		assert(json.length == 2);
+		assert(json["versions"].type != Json.Type.undefined);
+
+		file.write("{\n\t\"fileVersion\": ");
+		file.writeJsonString(json["fileVersion"]);
+		file.write(",\n\t\"versions\": {");
+		auto vers = json["versions"].get!(Json[string]);
+		bool first = true;
+		foreach (k; vers.byKey.array.sort()) {
+			if (!first) file.write(",");
+			else first = false;
+			file.write("\n\t\t");
+			file.writeJsonString(Json(k));
+			file.write(": ");
+			file.writeJsonString(vers[k]);
+		}
+		file.write("\n\t}\n}\n");
 		m_dirty = false;
+		m_bare = false;
 	}
 
 	static Json dependencyToJson(Dependency d)

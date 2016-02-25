@@ -14,6 +14,7 @@ import dub.internal.vibecompat.core.log;
 import dub.internal.vibecompat.inet.path;
 import dub.recipe.packagerecipe;
 
+import std.algorithm : map;
 import std.conv;
 import std.string : startsWith;
 
@@ -34,6 +35,7 @@ void parseSDL(ref PackageRecipe recipe, Tag sdl, string parent_name)
 		switch (n.fullName) {
 			default: break;
 			case "name": recipe.name = n.stringTagValue; break;
+			case "version": recipe.version_ = n.stringTagValue; break;
 			case "description": recipe.description = n.stringTagValue; break;
 			case "homepage": recipe.homepage = n.stringTagValue; break;
 			case "authors": recipe.authors ~= n.stringArrayTagValue; break;
@@ -82,11 +84,44 @@ void parseSDL(ref PackageRecipe recipe, Tag sdl, string parent_name)
 	}
 }
 
+Tag toSDL(in ref PackageRecipe recipe)
+{
+	Tag ret = new Tag;
+	void add(T)(string field, T value) { ret.add(new Tag(null, field, [Value(value)])); }
+	add("name", recipe.name);
+	if (recipe.version_.length) add("version", recipe.version_);
+	if (recipe.description.length) add("description", recipe.description);
+	if (recipe.homepage.length) add("homepage", recipe.homepage);
+	if (recipe.authors.length) ret.add(new Tag(null, "authors", recipe.authors.map!(a => Value(a)).array));
+	if (recipe.copyright.length) add("copyright", recipe.copyright);
+	if (recipe.license.length) add("license", recipe.license);
+	foreach (name, settings; recipe.buildTypes) {
+		auto t = new Tag(null, "buildType", [Value(name)]);
+		t.add(settings.toSDL());
+		ret.add(t);
+	}
+	if (recipe.ddoxFilterArgs.length)
+		ret.add(new Tag("x", "ddoxFilterArgs", recipe.ddoxFilterArgs.map!(a => Value(a)).array));
+	if (recipe.ddoxTool.length) ret.add(new Tag("x", "ddoxTool", [Value(recipe.ddoxTool)]));
+	ret.add(recipe.buildSettings.toSDL());
+	foreach(config; recipe.configurations)
+		ret.add(config.toSDL());
+	foreach (i, subPackage; recipe.subPackages) {
+		if (subPackage.path !is null) {
+			add("subPackage", subPackage.path);
+		} else {
+			auto t = subPackage.recipe.toSDL();
+			t.name = "subPackage";
+			ret.add(t);
+		}
+	}
+	return ret;
+}
+
 private void parseBuildSettings(Tag settings, ref BuildSettingsTemplate bs, string package_name)
 {
-	foreach (setting; settings.tags) {
+	foreach (setting; settings.tags)
 		parseBuildSetting(setting, bs, package_name);
-	}
 }
 
 private void parseBuildSetting(Tag setting, ref BuildSettingsTemplate bs, string package_name)
@@ -127,6 +162,8 @@ private void parseBuildSetting(Tag setting, ref BuildSettingsTemplate bs, string
 
 private void parseDependency(Tag t, ref BuildSettingsTemplate bs, string package_name)
 {
+	enforceSDL(t.values.length != 0, "Missing dependency name.", t);
+	enforceSDL(t.values.length == 1, "Multiple dependency names.", t);
 	auto pkg = expandPackageName(t.values[0].get!string, package_name, t);
 	enforce(pkg !in bs.dependencies, "The dependency '"~pkg~"' is specified more than once." );
 
@@ -148,17 +185,10 @@ private void parseDependency(Tag t, ref BuildSettingsTemplate bs, string package
 	if ("optional" in attrs)
 		dep.optional = attrs["optional"][0].value.get!bool;
 
-	bs.dependencies[pkg] = dep;
-}
+	if ("default" in attrs)
+		dep.default_ = attrs["default"][0].value.get!bool;
 
-private string expandPackageName(string name, string parent_name, Tag tag)
-{
-	import std.algorithm : canFind;
-	import std.string : format;
-	if (name.startsWith(":")) {
-		enforceSDL(!parent_name.canFind(':'), format("Short-hand packages syntax not allowed within sub packages: %s -> %s", parent_name, name), tag);
-		return parent_name ~ name;
-	} else return name;
+	bs.dependencies[pkg] = dep;
 }
 
 private void parseConfiguration(Tag t, ref ConfigurationInfo ret, string package_name)
@@ -170,6 +200,75 @@ private void parseConfiguration(Tag t, ref ConfigurationInfo ret, string package
 			case "platforms": ret.platforms ~= f.stringArrayTagValue; break;
 		}
 	}
+}
+
+private Tag toSDL(in ref ConfigurationInfo config)
+{
+	auto ret = new Tag(null, "configuration", [Value(config.name)]);
+	if (config.platforms.length) ret.add(new Tag(null, "platforms", config.platforms[].map!(p => Value(p)).array));
+	ret.add(config.buildSettings.toSDL());
+	return ret;
+}
+
+private Tag[] toSDL(in ref BuildSettingsTemplate bs)
+{
+	Tag[] ret;
+	void add(string name, string value) { ret ~= new Tag(null, name, [Value(value)]); }
+	void adda(string name, string suffix, in string[] values) {
+		ret ~= new Tag(null, name, values[].map!(v => Value(v)).array,
+			suffix.length ? [new Attribute(null, "platform", Value(suffix[1 .. $]))] : null);
+	}
+
+	string[] toNameArray(T, U)(U bits) if(is(T == enum)) {
+		string[] ret;
+		foreach (m; __traits(allMembers, T))
+			if (bits & __traits(getMember, T, m))
+				ret ~= m;
+		return ret;
+	}
+	
+	foreach (pack, d; bs.dependencies) {
+		Attribute[] attribs;
+		if (d.path.length) attribs ~= new Attribute(null, "path", Value(d.path.toString()));
+		else attribs ~= new Attribute(null, "version", Value(d.versionString));
+		if (d.optional) attribs ~= new Attribute(null, "optional", Value(true));
+		ret ~= new Tag(null, "dependency", [Value(pack)], attribs);
+	}
+	if (bs.systemDependencies !is null) add("systemDependencies", bs.systemDependencies);
+	if (bs.targetType != TargetType.autodetect) add("targetType", bs.targetType.to!string());
+	if (bs.targetPath.length) add("targetPath", bs.targetPath);
+	if (bs.targetName.length) add("targetName", bs.targetName);
+	if (bs.workingDirectory.length) add("workingDirectory", bs.workingDirectory);
+	if (bs.mainSourceFile.length) add("mainSourceFile", bs.mainSourceFile);
+	foreach (pack, conf; bs.subConfigurations) ret ~= new Tag(null, "subConfiguration", [Value(pack), Value(conf)]);
+	foreach (suffix, arr; bs.dflags) adda("dflags", suffix, arr);
+	foreach (suffix, arr; bs.lflags) adda("lflags", suffix, arr);
+	foreach (suffix, arr; bs.libs) adda("libs", suffix, arr);
+	foreach (suffix, arr; bs.sourceFiles) adda("sourceFiles", suffix, arr);
+	foreach (suffix, arr; bs.sourcePaths) adda("sourcePaths", suffix, arr);
+	foreach (suffix, arr; bs.excludedSourceFiles) adda("excludedSourceFiles", suffix, arr);
+	foreach (suffix, arr; bs.copyFiles) adda("copyFiles", suffix, arr);
+	foreach (suffix, arr; bs.versions) adda("versions", suffix, arr);
+	foreach (suffix, arr; bs.debugVersions) adda("debugVersions", suffix, arr);
+	foreach (suffix, arr; bs.importPaths) adda("importPaths", suffix, arr);
+	foreach (suffix, arr; bs.stringImportPaths) adda("stringImportPaths", suffix, arr);
+	foreach (suffix, arr; bs.preGenerateCommands) adda("preGenerateCommands", suffix, arr);
+	foreach (suffix, arr; bs.postGenerateCommands) adda("postGenerateCommands", suffix, arr);
+	foreach (suffix, arr; bs.preBuildCommands) adda("preBuildCommands", suffix, arr);
+	foreach (suffix, arr; bs.postBuildCommands) adda("postBuildCommands", suffix, arr);
+	foreach (suffix, bits; bs.buildRequirements) adda("buildRequirements", suffix, toNameArray!BuildRequirement(bits));
+	foreach (suffix, bits; bs.buildOptions) adda("buildOptions", suffix, toNameArray!BuildOption(bits));
+	return ret;
+}
+
+private string expandPackageName(string name, string parent_name, Tag tag)
+{
+	import std.algorithm : canFind;
+	import std.string : format;
+	if (name.startsWith(":")) {
+		enforceSDL(!parent_name.canFind(':'), format("Short-hand packages syntax not allowed within sub packages: %s -> %s", parent_name, name), tag);
+		return parent_name ~ name;
+	} else return name;
 }
 
 private string stringTagValue(Tag t, bool allow_child_tags = false)
@@ -237,6 +336,7 @@ authors "author 1" "author 2"
 authors "author 3"
 copyright "copyright string"
 license "license string"
+version "1.0.0"
 subPackage {
 	name "subpackage1"
 }
@@ -261,6 +361,7 @@ buildType "release" {
 }
 x:ddoxFilterArgs "-arg1" "-arg2"
 x:ddoxFilterArgs "-arg3"
+x:ddoxTool "ddoxtool"
 
 dependency ":subpackage1" optional=false path="."
 dependency "somedep" version="1.0.0" optional=true
@@ -304,14 +405,18 @@ dflags "df3"
 lflags "lf1" "lf2"
 lflags "lf3"
 `;
+	PackageRecipe rec1;
+	parseSDL(rec1, sdl, null, "testfile");
 	PackageRecipe rec;
-	parseSDL(rec, sdl, null, "testfile");
+	parseSDL(rec, rec1.toSDL(), null); // verify that all fields are serialized properly
+
 	assert(rec.name == "projectname");
 	assert(rec.description == "project description");
 	assert(rec.homepage == "http://example.com");
 	assert(rec.authors == ["author 1", "author 2", "author 3"]);
 	assert(rec.copyright == "copyright string");
 	assert(rec.license == "license string");
+	assert(rec.version_ == "1.0.0");
 	assert(rec.subPackages.length == 3);
 	assert(rec.subPackages[0].path == "");
 	assert(rec.subPackages[0].recipe.name == "subpackage1");
@@ -331,6 +436,7 @@ lflags "lf3"
 	assert(rec.buildTypes["debug"].dflags == ["": ["-g", "-debug"]]);
 	assert(rec.buildTypes["release"].dflags == ["": ["-release", "-O"]]);
 	assert(rec.ddoxFilterArgs == ["-arg1", "-arg2", "-arg3"], rec.ddoxFilterArgs.to!string);
+	assert(rec.ddoxTool == "ddoxtool");
 	assert(rec.buildSettings.dependencies.length == 2);
 	assert(rec.buildSettings.dependencies["projectname:subpackage1"].optional == false);
 	assert(rec.buildSettings.dependencies["projectname:subpackage1"].path == Path("."));
@@ -403,4 +509,19 @@ unittest { // test single value fields
 		`name ""
 		versions "hello" 10`
 		, null, "testfile"));
+}
+
+unittest { // test basic serialization
+	PackageRecipe p;
+	p.name = "test";
+	p.authors = ["foo", "bar"];
+	p.buildSettings.dflags["-windows"] = ["-a"];
+	p.buildSettings.lflags[""] = ["-b", "-c"];
+	auto sdl = toSDL(p).toSDLDocument();
+	assert(sdl == 
+`name "test"
+authors "foo" "bar"
+dflags "-a" platform="windows"
+lflags "-b" "-c"
+`);
 }

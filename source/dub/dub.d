@@ -96,7 +96,7 @@ class Dub {
 		m_rootPath = Path(root_path);
 		if (!m_rootPath.absolute) m_rootPath = Path(getcwd()) ~ m_rootPath;
 
-		this();
+		init();
 
 		PackageSupplier[] ps = additional_package_suppliers;
 
@@ -117,10 +117,6 @@ class Dub {
 		if (skip_registry < SkipRegistry.standard)
 			ps ~= defaultPackageSuppliers();
 
-		auto cacheDir = m_userDubPath ~ "cache/";
-		foreach (p; ps)
-			p.cacheOp(cacheDir, CacheOp.load);
-
 		m_packageSuppliers = ps;
 		m_packageManager = new PackageManager(m_userDubPath, m_systemDubPath);
 		updatePackageSearchPath();
@@ -129,13 +125,13 @@ class Dub {
 	/// Initializes DUB with only a single search path
 	this(Path override_path)
 	{
-		this();
+		init();
 		m_overrideSearchPath = override_path;
 		m_packageManager = new PackageManager(Path(), Path(), false);
 		updatePackageSearchPath();
 	}
 
-	private this()
+	private void init()
 	{
 		version(Windows){
 			m_systemDubPath = Path(environment.get("ProgramData")) ~ "dub/";
@@ -151,22 +147,6 @@ class Dub {
 
 		m_userConfig = jsonFromFile(m_userDubPath ~ "settings.json", true);
 		m_systemConfig = jsonFromFile(m_systemDubPath ~ "settings.json", true);
-	}
-
-	/// Perform cleanup and persist caches to disk
-	void shutdown()
-	{
-		auto cacheDir = m_userDubPath ~ "cache/";
-		foreach (p; m_packageSuppliers)
-			p.cacheOp(cacheDir, CacheOp.store);
-	}
-
-	/// cleans all metadata caches
-	void cleanCaches()
-	{
-		auto cacheDir = m_userDubPath ~ "cache/";
-		foreach (p; m_packageSuppliers)
-			p.cacheOp(cacheDir, CacheOp.clean);
 	}
 
 	@property void dryRun(bool v) { m_dryRun = v; }
@@ -247,7 +227,9 @@ class Dub {
 			foreach (p; m_project.selections.selectedPackages) {
 				auto dep = m_project.selections.getSelectedVersion(p);
 				if (!dep.path.empty) {
-					try if (m_packageManager.getOrLoadPackage(dep.path)) continue;
+					auto path = dep.path;
+					if (!path.absolute) path = this.rootPath ~ path;
+					try if (m_packageManager.getOrLoadPackage(path)) continue;
 					catch (Exception e) { logDebug("Failed to load path based selection: %s", e.toString().sanitize); }
 				} else {
 					if (m_packageManager.getPackage(p, dep.version_)) continue;
@@ -308,7 +290,8 @@ class Dub {
 			return;
 		}
 
-		foreach (p, ver; versions) {
+		foreach (p; versions.byKey) {
+			auto ver = versions[p]; // Workaround for DMD 2.070.0 AA issue (crashes in aaApply2 if iterating by key+value)
 			assert(!p.canFind(":"), "Resolved packages contain a sub package!?: "~p);
 			Package pack;
 			if (!ver.path.empty) {
@@ -333,8 +316,10 @@ class Dub {
 			fetchOpts |= (options & UpgradeOptions.preRelease) != 0 ? FetchOptions.usePrerelease : FetchOptions.none;
 			fetchOpts |= (options & UpgradeOptions.forceRemove) != 0 ? FetchOptions.forceRemove : FetchOptions.none;
 			if (!pack) fetch(p, ver, defaultPlacementLocation, fetchOpts, "getting selected version");
-			if ((options & UpgradeOptions.select) && ver.path.empty && p != m_project.rootPackage.name)
-				m_project.selections.selectVersion(p, ver.version_);
+			if ((options & UpgradeOptions.select) && p != m_project.rootPackage.name) {
+				if (ver.path.empty) m_project.selections.selectVersion(p, ver.version_);
+				else m_project.selections.selectVersion(p, ver.path);
+			}
 		}
 
 		m_project.reinit();
@@ -581,6 +566,13 @@ class Dub {
 		if (!placement.existsFile())
 			mkdirRecurse(placement.toNativeString());
 		Path dstpath = placement ~ (packageId ~ "-" ~ clean_package_version);
+		if (!dstpath.existsFile())
+			mkdirRecurse(dstpath.toNativeString());
+
+		// Support libraries typically used with git submodules like ae.
+		// Such libraries need to have ".." as import path but this can create
+		// import path leakage.
+		dstpath = dstpath ~ packageId;
 
 		auto lock = lockFile(dstpath.toNativeString() ~ ".lock", 30.seconds); // possibly wait for other dub instance
 		if (dstpath.existsFile())
@@ -695,24 +687,68 @@ class Dub {
 			.filter!(t => t[1].length);
 	}
 
-	void createEmptyPackage(Path path, string[] deps, string type, PackageFormat format = PackageFormat.sdl)
+	/** Returns a list of all available versions (including branches) for a
+		particular package.
+
+		The list returned is based on the registered package suppliers. Local
+		packages are not queried in the search for versions.
+
+		See_also: `getLatestVersion`
+	*/
+	Version[] listPackageVersions(string name)
+	{
+		Version[] versions;
+		foreach (ps; this.m_packageSuppliers) {
+			try versions ~= ps.getVersions(name);
+			catch (Exception e) {
+				logDebug("Failed to get versions for package %s on provider %s: %s", name, ps.description, e.msg);
+			}
+		}
+		return versions.sort().uniq.array;
+	}
+
+	/** Returns the latest available version for a particular package.
+
+		This function returns the latest numbered version of a package. If no
+		numbered versions are available, it will return an available branch,
+		preferring "~master".
+
+		Params:
+			package_name: The name of the package in question.
+			prefer_stable: If set to `true` (the default), returns the latest
+				stable version, even if there are newer pre-release versions.
+
+		See_also: `listPackageVersions`
+	*/
+	Version getLatestVersion(string package_name, bool prefer_stable = true)
+	{
+		auto vers = listPackageVersions(package_name);
+		enforce(!vers.empty, "Failed to find any valid versions for a package name of '"~package_name~"'.");
+		auto final_versions = vers.filter!(v => !v.isBranch && !v.isPreRelease).array;
+		if (prefer_stable && final_versions.length) return final_versions[$-1];
+		else if (vers[$-1].isBranch) return vers[$-1];
+		else return vers[$-1];
+	}
+
+	void createEmptyPackage(Path path, string[] deps, string type,
+		PackageFormat format = PackageFormat.sdl,
+		scope void delegate(ref PackageRecipe, ref PackageFormat) recipe_callback = null)
 	{
 		if (!path.absolute) path = m_rootPath ~ path;
 		path.normalize();
 
-		if (m_dryRun) return;
 		string[string] depVers;
 		string[] notFound; // keep track of any failed packages in here
-		foreach(ps; this.m_packageSuppliers){
-			foreach(dep; deps){
-				try{
-					auto versionStrings = ps.getVersions(dep);
-					depVers[dep] = versionStrings[$-1].toString;
-				} catch(Exception e){
-					notFound ~= dep;
-				}
+		foreach (dep; deps) {
+			Version ver;
+			try {
+				ver = getLatestVersion(dep);
+				depVers[dep] = ver.isBranch ? ver.toString() : "~>" ~ ver.toString();
+			} catch (Exception e) {
+				notFound ~= dep;
 			}
 		}
+
 		if(notFound.length > 1){
 			throw new Exception(.format("Couldn't find packages: %-(%s, %).", notFound));
 		}
@@ -720,10 +756,34 @@ class Dub {
 			throw new Exception(.format("Couldn't find package: %-(%s, %).", notFound));
 		}
 
-		initPackage(path, depVers, type, format);
+		if (m_dryRun) return;
+
+		initPackage(path, depVers, type, format, recipe_callback);
 
 		//Act smug to the user.
 		logInfo("Successfully created an empty project in '%s'.", path.toNativeString());
+	}
+
+	/** Converts the package recipe to the given format.
+
+		Params:
+			destination_file_ext = The file extension matching the desired
+				format. Possible values are "json" or "sdl".
+	*/
+	void convertRecipe(string destination_file_ext)
+	{
+		import std.path : extension;
+		import dub.recipe.io : writePackageRecipe;
+
+		auto srcfile = m_project.rootPackage.packageInfoFilename;
+		auto srcext = srcfile[$-1].toString().extension;
+		if (srcext == "."~destination_file_ext) {
+			logInfo("Package format is already %s.", destination_file_ext);
+			return;
+		}
+
+		writePackageRecipe(srcfile[0 .. $-1] ~ ("dub."~destination_file_ext), m_project.rootPackage.info);
+		removeFile(srcfile);
 	}
 
 	void runDdox(bool run)
@@ -982,16 +1042,24 @@ class DependencyVersionResolver : DependencyResolver!(Dependency, Dependency) {
 		if (!(m_options & UpgradeOptions.preRelease))
 			versions = versions.filter!(v => !v.isPreRelease).array ~ versions.filter!(v => v.isPreRelease).array;
 
+		// filter out invalid/unreachable dependency specs
+		versions = versions.filter!((v) {
+				bool valid = getPackage(pack, Dependency(v)) !is null;
+				if (!valid) logDiagnostic("Excluding invalid dependency specification %s %s from dependency resolution process.", pack, v);
+				return valid;
+			}).array;
+
 		if (!versions.length) logDiagnostic("Nothing found for %s", pack);
+		else logDiagnostic("Return for %s: %s", pack, versions);
 
 		auto ret = versions.map!(v => Dependency(v)).array;
 		m_packageVersions[pack] = ret;
 		return ret;
 	}
 
-	protected override Dependency[] getSpecificConfigs(TreeNodes nodes)
+	protected override Dependency[] getSpecificConfigs(string pack, TreeNodes nodes)
 	{
-		if (!nodes.configs.path.empty) return [nodes.configs];
+		if (!nodes.configs.path.empty && getPackage(pack, nodes.configs)) return [nodes.configs];
 		else return null;
 	}
 
@@ -1026,11 +1094,22 @@ class DependencyVersionResolver : DependencyResolver!(Dependency, Dependency) {
 				continue;
 			}
 
-			if (dspec.optional && !m_dub.packageManager.getFirstPackage(dname))
-				continue;
-			if (m_options & UpgradeOptions.upgrade || !m_selectedVersions || !m_selectedVersions.hasSelectedVersion(dbasename))
-				ret ~= TreeNodes(dname, dspec.mapToPath(pack.path));
-			else ret ~= TreeNodes(dname, m_selectedVersions.getSelectedVersion(dbasename));
+			DependencyType dt;
+			if (dspec.optional) {
+				if (dspec.default_) dt = DependencyType.optionalDefault;
+				else dt = DependencyType.optional;
+			} else dt = DependencyType.required;
+
+			if (m_options & UpgradeOptions.upgrade || !m_selectedVersions || !m_selectedVersions.hasSelectedVersion(dbasename)) {
+				// keep deselected dependencies deselected by default
+				if (m_selectedVersions && !m_selectedVersions.bare && dt == DependencyType.optionalDefault)
+					dt = DependencyType.optional;
+				ret ~= TreeNodes(dname, dspec.mapToPath(pack.path), dt);
+			} else {
+				// keep already selected optional dependencies if possible
+				if (dt == DependencyType.optional) dt = DependencyType.optionalDefault;
+				ret ~= TreeNodes(dname, m_selectedVersions.getSelectedVersion(dbasename), dt);
+			}
 		}
 		return ret.data;
 	}

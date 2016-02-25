@@ -68,6 +68,7 @@ CommandGroup[] getCommands()
 			new RemoveOverrideCommand,
 			new ListOverridesCommand,
 			new CleanCachesCommand,
+			new ConvertCommand,
 		)
 	];
 }
@@ -206,10 +207,7 @@ int runDubCommandLine(string[] args)
 	}
 
 	// execute the command
-	int rc;
-	try {
-		rc = cmd.execute(dub, remaining_args, app_args);
-	}
+	try return cmd.execute(dub, remaining_args, app_args);
 	catch (UsageException e) {
 		logError("%s", e.msg);
 		logDebug("Full exception: %s", e.toString().sanitize);
@@ -221,10 +219,6 @@ int runDubCommandLine(string[] args)
 		logDebug("Full exception: %s", e.toString().sanitize);
 		return 2;
 	}
-
-	if (!cmd.skipDubInitialization)
-		dub.shutdown();
-	return rc;
 }
 
 struct CommonOptions {
@@ -316,6 +310,33 @@ class Command {
 
 	abstract void prepare(scope CommandArgs args);
 	abstract int execute(Dub dub, string[] free_args, string[] app_args);
+
+	private bool loadCwdPackage(Dub dub, bool warn_missing_package)
+	{
+		bool found = existsFile(dub.rootPath ~ "source/app.d");
+		if (!found)
+			foreach (f; packageInfoFiles)
+				if (existsFile(dub.rootPath ~ f.filename)) {
+					found = true;
+					break;
+				}
+
+		if (!found) {
+			if (warn_missing_package) {
+				logInfo("");
+				logInfo("Neither a package description file, nor source/app.d was found in");
+				logInfo(dub.rootPath.toNativeString());
+				logInfo("Please run DUB from the root directory of an existing package, or run");
+				logInfo("\"dub init --help\" to get information on creating a new package.");
+				logInfo("");
+			}
+			return false;
+		}
+
+		dub.loadPackageFromCwd();
+
+		return true;
+	}
 }
 
 struct CommandGroup {
@@ -336,8 +357,9 @@ struct CommandGroup {
 
 class InitCommand : Command {
 	private{
-		string m_buildType = "minimal";
-		PackageFormat m_format = PackageFormat.sdl;
+		string m_templateType = "minimal";
+		PackageFormat m_format = PackageFormat.json;
+		bool m_nonInteractive;
 	}
 	this()
 	{
@@ -351,7 +373,7 @@ class InitCommand : Command {
 
 	override void prepare(scope CommandArgs args)
 	{
-		args.getopt("t|type", &m_buildType, [
+		args.getopt("t|type", &m_templateType, [
 			"Set the type of project to generate. Available types:",
 			"",
 			"minimal - simple \"hello world\" project (default)",
@@ -360,8 +382,9 @@ class InitCommand : Command {
 		]);
 		args.getopt("f|format", &m_format, [
 			"Sets the format to use for the package description file. Possible values:",
-			"  sdl, json"
+			"  " ~ [__traits(allMembers, PackageFormat)].map!(f => f == m_format.init.to!string ? f ~ " (default)" : f).join(", ")
 		]);
+		args.getopt("n|non-interactive", &m_nonInteractive, ["Don't enter interactive mode."]);
 	}
 
 	override int execute(Dub dub, string[] free_args, string[] app_args)
@@ -373,18 +396,63 @@ class InitCommand : Command {
 			dir = free_args[0];
 			free_args = free_args[1 .. $];
 		}
+
+		string input(string caption, string default_value)
+		{
+			writef("%s [%s]: ", caption, default_value);
+			auto inp = readln();
+			return inp.length > 1 ? inp[0 .. $-1] : default_value;
+		}
+
+		void depCallback(ref PackageRecipe p, ref PackageFormat fmt) {
+			if (m_nonInteractive) return;
+
+			while (true) {
+				string rawfmt = input("Package recipe format (sdl/json)", fmt.to!string);
+				if (!rawfmt.length) break;
+				try {
+					fmt = rawfmt.to!PackageFormat;
+					break;
+				} catch (Exception) {
+					logError("Invalid format, \""~rawfmt~"\", enter either \"sdl\" or \"json\".");
+				}
+			}
+			auto author = p.authors.join(", ");
+			p.name = input("Name", p.name);
+			p.description = input("Description", p.description);
+			p.authors = input("Author name", author).split(",").map!(a => a.strip).array;
+			p.license = input("License", p.license);
+			p.copyright = input("Copyright string", p.copyright);
+
+			while (true) {
+				auto depname = input("Add dependency (leave empty to skip)", null);
+				if (!depname.length) break;
+				try {
+					auto ver = dub.getLatestVersion(depname);
+					auto dep = ver.isBranch ? Dependency(ver) : Dependency("~>" ~ ver.toString());
+					p.buildSettings.dependencies[depname] =	dep;
+					logInfo("Added dependency %s %s", depname, dep.versionString);
+				} catch (Exception e) {
+					logError("Could not find package '%s'.", depname);
+					logDebug("Full error: %s", e.toString().sanitize);
+				}
+			}
+		}
+
 		//TODO: Remove this block in next version
 		// Checks if argument uses current method of specifying project type.
 		if (free_args.length)
 		{
 			if (["vibe.d", "deimos", "minimal"].canFind(free_args[0]))
 			{
-				m_buildType = free_args[0];
+				m_templateType = free_args[0];
 				free_args = free_args[1 .. $];
 				logInfo("Deprecated use of init type. Use --type=[vibe.d | deimos | minimal] in future.");
 			}
 		}
-		dub.createEmptyPackage(Path(dir), free_args, m_buildType, m_format);
+		dub.createEmptyPackage(Path(dir), free_args, m_templateType, m_format, &depCallback);
+
+		logInfo("Package sucessfully created in %s", dir.length ? dir : ".");
 		return 0;
 	}
 }
@@ -415,7 +483,7 @@ abstract class PackageBuildCommand : Command {
 		args.getopt("b|build", &m_buildType, [
 			"Specifies the type of build to perform. Note that setting the DFLAGS environment variable will override the build type with custom flags.",
 			"Possible names:",
-			"  debug (default), plain, release, release-nobounds, unittest, profile, profile-gc, docs, ddox, cov, unittest-cov and custom types"
+			"  debug (default), plain, release, release-debug, release-nobounds, unittest, profile, profile-gc, docs, ddox, cov, unittest-cov and custom types"
 		]);
 		args.getopt("c|config", &m_buildConfig, [
 			"Builds the specified configuration. Configurations can be defined in dub.json"
@@ -443,7 +511,7 @@ abstract class PackageBuildCommand : Command {
 		]);
 	}
 
-	protected void setupPackage(Dub dub, string package_name)
+	protected void setupPackage(Dub dub, string package_name, string default_build_type = "debug")
 	{
 		if (!m_compilerName.length) m_compilerName = dub.defaultCompiler;
 		m_compiler = getCompiler(m_compilerName);
@@ -464,7 +532,7 @@ abstract class PackageBuildCommand : Command {
 
 		if (m_buildType.length == 0) {
 			if (environment.get("DFLAGS") !is null) m_buildType = "$DFLAGS";
-			else m_buildType = "debug";
+			else m_buildType = default_build_type;
 		}
 
 		if (!m_nodeps) {
@@ -497,33 +565,6 @@ abstract class PackageBuildCommand : Command {
 		logInfo("Building package %s in %s", pack.name, pack.path.toNativeString());
 		dub.rootPath = pack.path;
 		dub.loadPackage(pack);
-		return true;
-	}
-
-	private bool loadCwdPackage(Dub dub, bool warn_missing_package)
-	{
-		bool found = existsFile(dub.rootPath ~ "source/app.d");
-		if (!found)
-			foreach (f; packageInfoFiles)
-				if (existsFile(dub.rootPath ~ f.filename)) {
-					found = true;
-					break;
-				}
-
-		if (!found) {
-			if (warn_missing_package) {
-				logInfo("");
-				logInfo("Neither a package description file, nor source/app.d was found in");
-				logInfo(dub.rootPath.toNativeString());
-				logInfo("Please run DUB from the root directory of an existing package, or run");
-				logInfo("\"dub init --help\" to get information on creating a new package.");
-				logInfo("");
-			}
-			return false;
-		}
-
-		dub.loadPackageFromCwd();
-
 		return true;
 	}
 }
@@ -720,8 +761,6 @@ class TestCommand : PackageBuildCommand {
 			`run the unit tests.`
 		];
 		this.acceptsAppArgs = true;
-
-		m_buildType = "unittest";
 	}
 
 	override void prepare(scope CommandArgs args)
@@ -750,7 +789,7 @@ class TestCommand : PackageBuildCommand {
 		enforceUsage(free_args.length <= 1, "Expected one or zero arguments.");
 		if (free_args.length >= 1) package_name = free_args[0];
 
-		setupPackage(dub, package_name);
+		setupPackage(dub, package_name, "unittest");
 
 		GeneratorSettings settings;
 		settings.platform = m_buildPlatform;
@@ -962,7 +1001,7 @@ class UpgradeCommand : Command {
 			"Force deletion of fetched packages with untracked files"
 		]);
 		args.getopt("verify", &m_verify, [
-			"Updates the project and performs a build. If successfull, rewrites the selected versions file <to be implemeted>."
+			"Updates the project and performs a build. If successful, rewrites the selected versions file <to be implemeted>."
 		]);
 		args.getopt("missing-only", &m_missingOnly, [
 			"Performs an upgrade only for dependencies that don't yet have a version selected. This is also done automatically before each build."
@@ -1436,7 +1475,6 @@ class CleanCachesCommand : Command {
 
 	override int execute(Dub dub, string[] free_args, string[] app_args)
 	{
-		dub.cleanCaches();
 		return 0;
 	}
 }
@@ -1584,7 +1622,7 @@ class DustmiteCommand : PackageBuildCommand {
 			auto testcmd = appender!string();
 			testcmd.formattedWrite("%s dustmite --vquiet --test-package=%s --build=%s --config=%s",
 				thisExePath, prj.name, m_buildType, m_buildConfig);
-			
+
 			if (m_compilerName.length) testcmd.formattedWrite(" \"--compiler=%s\"", m_compilerName);
 			if (m_arch.length) testcmd.formattedWrite(" --arch=%s", m_arch);
 			if (m_compilerStatusCode != int.min) testcmd.formattedWrite(" --compiler-status=%s", m_compilerStatusCode);
@@ -1640,6 +1678,44 @@ class DustmiteCommand : PackageBuildCommand {
 		{
 			super(message, file, line, next);
 		}
+	}
+}
+
+
+/******************************************************************************/
+/* CONVERT command                                                               */
+/******************************************************************************/
+
+class ConvertCommand : Command {
+	private {
+		string m_format;
+	}
+
+	this()
+	{
+		this.name = "convert";
+		this.argumentsPattern = "";
+		this.description = "Converts the file format of the package recipe.";
+		this.helpText = [
+			"This command will convert between JSON and SDLang formatted package recipe files."
+			"",
+			"Warning: Beware that any formatting and comments within the package recipe will get lost in the conversion process."
+		];
+	}
+
+	override void prepare(scope CommandArgs args)
+	{
+		args.getopt("f|format", &m_format, ["Specifies the target package recipe format. Possible values:", "  json, sdl"]);
+	}
+
+	override int execute(Dub dub, string[] free_args, string[] app_args)
+	{
+		enforceUsage(app_args.length == 0, "Unexpected application arguments.");
+		enforceUsage(free_args.length == 0, "Unexpected arguments: "~free_args.join(" "));
+		enforceUsage(m_format.length > 0, "Missing target format file extension (--format=...).");
+		if (!loadCwdPackage(dub, true)) return 1;
+		dub.convertRecipe(m_format);
+		return 0;
 	}
 }
 
